@@ -183,16 +183,16 @@ class OnnxV3LiteEngine:
     # ── artifact helpers ──────────────────────────────────────────────────────
     @staticmethod
     def _fetch(repo: str, files: List[str], subfolder: Optional[str]) -> Path:
+        from pathlib import Path
+        if "MOSS" in repo:
+            return Path("/Users/binhozil/AI/voice-platform/models/moss-tokenizer-real")
+        if "pnnbao" in repo:
+            return Path("/Users/binhozil/AI/voice-platform/models/vieneu-v3-turbo-real")
         from huggingface_hub import hf_hub_download
         last = None
         for fn in files:
-            try:
-                last = hf_hub_download(repo, fn, repo_type="model", subfolder=subfolder or None)
-            except Exception:
-                if fn.endswith((".json",)):
-                    continue  # optional meta may live elsewhere
-                raise
-        return Path(last).parent
+            last = hf_hub_download(repo, fn, repo_type="model", subfolder=subfolder or None)
+        return Path(last)
 
     def _load_denoiser(self):
         try:
