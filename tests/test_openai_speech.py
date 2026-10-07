@@ -2,7 +2,9 @@
 stream slots, health, auth and the listening address. ``Engine.__init__`` runs
 for real."""
 import gc
+import io
 import logging
+import wave
 from types import SimpleNamespace
 
 import numpy as np
@@ -37,10 +39,11 @@ class FakeTTS:
 
 
 @pytest.fixture
-def eng(monkeypatch):
+def eng(monkeypatch, tmp_path):
     for var in ("VIENEU_API_KEY", "VIENEU_MAX_STREAMS", "VIENEU_QUEUE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(api, "Vieneu", lambda **kw: FakeTTS())
+    monkeypatch.setenv("VIENEU_HOME", str(tmp_path))
     e = api.Engine()
     monkeypatch.setattr(api, "ENGINE", e)
     return e
@@ -54,6 +57,16 @@ def client(eng):
 
 def _speech(client, **body):
     return client.post("/v1/audio/speech", json={"input": "Xin chào.", **body})
+
+
+def _wav(seconds=3.2, sample_rate=8_000):
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\0\0" * int(seconds * sample_rate))
+    return out.getvalue()
 
 
 def test_valid_request_streams_wav(client, eng):
@@ -111,9 +124,19 @@ def test_builtin_voice_cannot_be_replaced(client, eng, name):
 
 def test_new_voice_is_enrolled(client, eng):
     r = client.post("/v1/voices", data={"name": "Giọng của tôi"},
-                    files={"file": ("me.wav", b"RIFF", "audio/wav")})
+                    files={"file": ("me.wav", _wav(), "audio/wav")})
     assert r.status_code == 200
+    assert r.json()["persisted"] is True
     assert eng.tts.enrolled == ["Giọng của tôi"]
+
+
+@pytest.mark.parametrize("seconds", [2.9, 8.1])
+def test_clone_reference_must_be_three_to_eight_seconds(client, eng, seconds):
+    r = client.post("/v1/voices", data={"name": "Giọng thử"},
+                    files={"file": ("me.wav", _wav(seconds), "audio/wav")})
+    assert r.status_code == 400
+    assert "3-8 seconds" in r.json()["error"]["message"]
+    assert eng.tts.enrolled == []
 
 
 def test_dead_scheduler_fails_health_and_new_requests(client, eng):

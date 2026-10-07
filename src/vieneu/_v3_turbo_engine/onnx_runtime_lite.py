@@ -209,16 +209,25 @@ class OnnxV3LiteEngine:
             return str(p / filename)
         try:
             from huggingface_hub import hf_hub_download
-            return hf_hub_download(self.checkpoint_path, filename)
+            # ``checkpoint_path`` is commonly a local ONNX directory. Cloning
+            # assets live at the root of the original model repository, so a
+            # local graph directory must fall back to that repository.
+            repo = self.checkpoint_path if not p.is_dir() else os.environ.get("VIENEU_CLONE_REPO", _V3_REPO)
+            return hf_hub_download(repo, filename)
         except Exception:
             return None
 
     def _ensure_speaker_encoder(self):
         if self.speaker_encoder is None:
             from .speaker import OnnxSpeakerEncoder
-            self.speaker_encoder = OnnxSpeakerEncoder.from_pretrained(
-                self.checkpoint_path, filename=self.speaker_encoder_filename, device="cpu",
-                sess_options=self._so)
+            path = self._resolve_root_file(self.speaker_encoder_filename)
+            if not path:
+                raise FileNotFoundError(
+                    f"Missing {self.speaker_encoder_filename}; place it in the model directory "
+                    f"or allow download from {os.environ.get('VIENEU_CLONE_REPO', _V3_REPO)}"
+                )
+            self.speaker_encoder = OnnxSpeakerEncoder(
+                path, device="cpu", sess_options=self._so)
         return self.speaker_encoder
 
     # ── numpy embedding / speaker anchor / heads / sampling ────────────────────

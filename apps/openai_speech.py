@@ -77,6 +77,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from vieneu import Vieneu
+from apps.user_voices import load_user_voices, save_user_voice
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vieneu.api")
@@ -112,6 +113,9 @@ class Engine:
         # The voices and aliases that exist before any client enrolls one;
         # POST /v1/voices may not replace them.
         self.builtin_voices = frozenset(self.tts._preset_voices) | frozenset(self.tts._voice_aliases)
+        loaded_voices = load_user_voices(self.tts)
+        if loaded_voices:
+            log.info("loaded %d saved voice(s): %s", len(loaded_voices), ", ".join(loaded_voices))
         self.watermark = os.environ.get("VIENEU_WATERMARK", "1") != "0"
         # GPU: the scheduler batches every stream. CPU: the ONNX engine interleaves
         # calls frame by frame, but they share the cores — measured on a 6-core
@@ -401,10 +405,26 @@ _CLIP_EXTS = {".wav": ".wav", ".mp3": ".mp3", ".flac": ".flac", ".ogg": ".ogg", 
 _MAX_CLIP_BYTES = 20 * 1024 * 1024
 
 
+def _clip_duration(path: str) -> float:
+    """Return decoded duration without loading the whole reference into memory."""
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        if info.samplerate <= 0:
+            raise ValueError("invalid sample rate")
+        return info.frames / info.samplerate
+    except Exception as first_error:
+        try:
+            import librosa
+            return float(librosa.get_duration(path=path))
+        except Exception as second_error:
+            raise ValueError(f"unsupported or unreadable audio: {first_error}") from second_error
+
+
 @app.post("/v1/voices", dependencies=[Depends(_auth)])
 def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool = Form(True),
               description: str = Form("")):
-    """Enroll a 3-8 s reference clip as ``voice=name`` (in memory, for this process).
+    """Enroll and persist a 3-8 s reference clip as ``voice=name``.
 
     Plain ``def``: FastAPI runs it in a thread, so the blocking upload read,
     temp file and enrolment do not stall the event loop.
@@ -423,18 +443,23 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
     data = file.file.read(_MAX_CLIP_BYTES + 1)
     if len(data) > _MAX_CLIP_BYTES:
         raise HTTPException(413, "reference clip larger than 20 MB")
+    if not data:
+        raise HTTPException(400, "reference clip is empty")
     fd, path = tempfile.mkstemp(suffix=ext)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        eng.tts.add_voice(name, path, denoise=denoise, description=description)
+        duration = _clip_duration(path)
+        if not 3.0 <= duration <= 8.0:
+            raise HTTPException(400, f"reference clip must be 3-8 seconds (received {duration:.2f}s)")
+        save_user_voice(eng.tts, name, path, denoise=denoise, description=description)
     except HTTPException:
         raise
     except Exception as e:   # noqa: BLE001
         raise HTTPException(400, f"could not enroll voice: {e}")
     finally:
         os.unlink(path)
-    return {"id": name, "name": name, "description": description}
+    return {"id": name, "name": name, "description": description, "persisted": True}
 
 
 @app.get("/health")
