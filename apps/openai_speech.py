@@ -55,6 +55,7 @@ Environment:
 from __future__ import annotations
 
 import base64
+import gc
 import hmac
 import io
 import json
@@ -192,13 +193,30 @@ class _Slot:
 
 
 ENGINE: Optional[Engine] = None
+ENGINE_LOCK = threading.Lock()
+ENGINE_LAST_USED = 0.0
+ENGINE_IDLE_TIMEOUT = float(os.environ.get("VIENEU_IDLE_TIMEOUT", "900"))
 
 
 def engine() -> Engine:
+    global ENGINE, ENGINE_LAST_USED
+    with ENGINE_LOCK:
+        if ENGINE is None:
+            ENGINE = Engine()
+        ENGINE_LAST_USED = time.monotonic()
+        return ENGINE
+
+
+def _idle_reaper() -> None:
     global ENGINE
-    if ENGINE is None:
-        ENGINE = Engine()
-    return ENGINE
+    while True:
+        time.sleep(min(30.0, max(1.0, ENGINE_IDLE_TIMEOUT)))
+        with ENGINE_LOCK:
+            if (ENGINE is not None and ENGINE.active == 0 and ENGINE.waiting == 0 and
+                    time.monotonic() - ENGINE_LAST_USED >= ENGINE_IDLE_TIMEOUT):
+                log.info("unloading VieNeu after %.0fs idle", ENGINE_IDLE_TIMEOUT)
+                ENGINE = None
+                gc.collect()
 
 
 # ── auth / errors in OpenAI's shape ───────────────────────────────────────────
@@ -235,7 +253,8 @@ async def _invalid_request(_req: Request, exc: RequestValidationError):
 
 @app.on_event("startup")
 def _startup() -> None:
-    engine()
+    threading.Thread(target=_idle_reaper, daemon=True, name="vieneu-idle-reaper").start()
+    log.info("VieNeu API ready; model will load on first speech/clone request")
 
 
 # ── audio helpers ────────────────────────────────────────────────────────────
@@ -524,9 +543,12 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
 
 @app.get("/health")
 def health():
-    eng = engine()
+    eng = ENGINE
+    if eng is None:
+        return {"status": "ok", "model_loaded": False, "sample_rate": SAMPLE_RATE}
     body = {"status": "ok", "backend": eng.backend, "max_streams": eng.max_streams,
-            "active": eng.active, "waiting": eng.waiting, "sample_rate": SAMPLE_RATE}
+            "active": eng.active, "waiting": eng.waiting, "sample_rate": SAMPLE_RATE,
+            "model_loaded": True}
     err = eng.stream_error()
     if err is not None:
         # 503 so a container healthcheck restarts us: the scheduler does not recover.
