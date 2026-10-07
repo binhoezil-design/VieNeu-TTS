@@ -405,20 +405,79 @@ _CLIP_EXTS = {".wav": ".wav", ".mp3": ".mp3", ".flac": ".flac", ".ogg": ".ogg", 
 _MAX_CLIP_BYTES = 20 * 1024 * 1024
 
 
-def _clip_duration(path: str) -> float:
-    """Return decoded duration without loading the whole reference into memory."""
+def _prepare_clone_clip(source: str, destination: str) -> dict:
+    """Decode, remove edge silence and select the best speech-rich <=8 s window."""
+    import soundfile as sf
+
     try:
-        import soundfile as sf
-        info = sf.info(path)
-        if info.samplerate <= 0:
-            raise ValueError("invalid sample rate")
-        return info.frames / info.samplerate
+        wav, sr = sf.read(source, dtype="float32", always_2d=False)
     except Exception as first_error:
         try:
             import librosa
-            return float(librosa.get_duration(path=path))
+            wav, sr = librosa.load(source, sr=None, mono=True)
         except Exception as second_error:
             raise ValueError(f"unsupported or unreadable audio: {first_error}") from second_error
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim == 2:
+        wav = wav.mean(axis=1)
+    if sr <= 0 or wav.size == 0 or not np.isfinite(wav).all():
+        raise ValueError("unsupported, empty or invalid audio")
+
+    original_duration = wav.size / sr
+    # Lightweight energy VAD: 20 ms frames, a -35 dB threshold relative to the
+    # loudest frame, and 100 ms padding around detected speech.
+    frame = max(1, int(0.02 * sr))
+    frame_count = (wav.size + frame - 1) // frame
+    padded = np.pad(wav, (0, frame_count * frame - wav.size))
+    frame_rms = np.sqrt(np.mean(padded.reshape(frame_count, frame) ** 2, axis=1))
+    threshold = max(float(frame_rms.max()) * (10 ** (-35 / 20)), 1e-4)
+    active = frame_rms >= threshold
+    voiced_samples = int(active.sum()) * frame
+    voiced_duration = voiced_samples / sr
+    if voiced_duration < 3.0:
+        raise ValueError(
+            f"reference needs at least 3 seconds of clear speech (detected {voiced_duration:.2f}s)"
+        )
+
+    active_indices = np.flatnonzero(active)
+    padding = int(0.1 * sr)
+    first = max(0, int(active_indices[0]) * frame - padding)
+    last = min(wav.size, (int(active_indices[-1]) + 1) * frame + padding)
+    trimmed = wav[first:last]
+    max_samples = int(8.0 * sr)
+    auto_trimmed = first > 0 or last < wav.size
+
+    if trimmed.size > max_samples:
+        # Rank candidate windows by detected speech coverage, then RMS. Candidate
+        # boundaries include each speech start/end plus a 100 ms scan grid.
+        speech_mask = np.repeat(active, frame)[:wav.size][first:last]
+        step = max(1, int(0.1 * sr))
+        starts = set(range(0, trimmed.size - max_samples + 1, step))
+        starts.add(trimmed.size - max_samples)
+
+        def score(start: int):
+            end = start + max_samples
+            speech = int(speech_mask[start:end].sum())
+            segment = trimmed[start:end]
+            rms = float(np.sqrt(np.mean(segment * segment)))
+            return speech, rms
+
+        best_start = max(starts, key=score)
+        trimmed = trimmed[best_start:best_start + max_samples]
+        auto_trimmed = True
+
+    # Normalize conservatively: target about -20 dBFS without ever clipping.
+    rms = float(np.sqrt(np.mean(trimmed * trimmed)))
+    if rms > 1e-6:
+        gain = min(0.1 / rms, 10.0, 0.95 / max(float(np.max(np.abs(trimmed))), 1e-6))
+        trimmed = trimmed * gain
+    sf.write(destination, trimmed, sr, subtype="PCM_16")
+    return {
+        "original_duration": round(original_duration, 2),
+        "selected_duration": round(trimmed.size / sr, 2),
+        "voiced_duration": round(voiced_duration, 2),
+        "auto_trimmed": auto_trimmed,
+    }
 
 
 @app.post("/v1/voices", dependencies=[Depends(_auth)])
@@ -446,20 +505,21 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
     if not data:
         raise HTTPException(400, "reference clip is empty")
     fd, path = tempfile.mkstemp(suffix=ext)
+    processed_fd, processed_path = tempfile.mkstemp(suffix=".wav")
+    os.close(processed_fd)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        duration = _clip_duration(path)
-        if not 3.0 <= duration <= 8.0:
-            raise HTTPException(400, f"reference clip must be 3-8 seconds (received {duration:.2f}s)")
-        save_user_voice(eng.tts, name, path, denoise=denoise, description=description)
+        clip = _prepare_clone_clip(path, processed_path)
+        save_user_voice(eng.tts, name, processed_path, denoise=denoise, description=description)
     except HTTPException:
         raise
     except Exception as e:   # noqa: BLE001
         raise HTTPException(400, f"could not enroll voice: {e}")
     finally:
         os.unlink(path)
-    return {"id": name, "name": name, "description": description, "persisted": True}
+        os.unlink(processed_path)
+    return {"id": name, "name": name, "description": description, "persisted": True, **clip}
 
 
 @app.get("/health")

@@ -61,11 +61,13 @@ def _speech(client, **body):
 
 def _wav(seconds=3.2, sample_rate=8_000):
     out = io.BytesIO()
+    samples = (np.sin(2 * np.pi * 220 * np.arange(int(seconds * sample_rate)) / sample_rate)
+               * 8000).astype("<i2")
     with wave.open(out, "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(sample_rate)
-        wav.writeframes(b"\0\0" * int(seconds * sample_rate))
+        wav.writeframes(samples.tobytes())
     return out.getvalue()
 
 
@@ -130,13 +132,22 @@ def test_new_voice_is_enrolled(client, eng):
     assert eng.tts.enrolled == ["Giọng của tôi"]
 
 
-@pytest.mark.parametrize("seconds", [2.9, 8.1])
-def test_clone_reference_must_be_three_to_eight_seconds(client, eng, seconds):
+def test_clone_reference_needs_three_seconds_of_speech(client, eng):
     r = client.post("/v1/voices", data={"name": "Giọng thử"},
-                    files={"file": ("me.wav", _wav(seconds), "audio/wav")})
+                    files={"file": ("me.wav", _wav(2.9), "audio/wav")})
     assert r.status_code == 400
-    assert "3-8 seconds" in r.json()["error"]["message"]
+    assert "at least 3 seconds" in r.json()["error"]["message"]
     assert eng.tts.enrolled == []
+
+
+def test_long_clone_reference_is_automatically_reduced_to_eight_seconds(client, eng):
+    r = client.post("/v1/voices", data={"name": "Giọng dài"},
+                    files={"file": ("long.wav", _wav(11), "audio/wav")})
+    assert r.status_code == 200
+    assert r.json()["auto_trimmed"] is True
+    assert r.json()["original_duration"] == 11.0
+    assert r.json()["selected_duration"] == 8.0
+    assert eng.tts.enrolled == ["Giọng dài"]
 
 
 def test_dead_scheduler_fails_health_and_new_requests(client, eng):
