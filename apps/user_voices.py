@@ -153,3 +153,24 @@ def delete_user_voice(tts, name: str) -> None:
         raise ValueError("Chỉ xoá được giọng do bạn lưu.")
     tts.remove_voice(name)
     _write(tts)
+
+
+def update_user_voice(tts, name: str, *, new_name: str | None = None,
+                      description: str | None = None) -> str:
+    """Update a saved clone without touching built-in voices."""
+    entry = tts._preset_voices.get(name) if supports_saving(tts) else None
+    if entry is None or not entry.get(USER_MARK):
+        raise ValueError("Chỉ sửa được giọng do bạn lưu.")
+    target = (new_name or name).strip()
+    if not target or len(target) > 40 or "—" in target:
+        raise ValueError("Tên giọng không hợp lệ hoặc dài quá 40 ký tự.")
+    occupied = tts._preset_voices.get(target)
+    if target != name and occupied is not None:
+        raise ValueError(f"Giọng '{target}' đã tồn tại.")
+    if description is not None:
+        entry["description"] = description.strip() or DEFAULT_DESC
+    if target != name:
+        tts._preset_voices[target] = entry
+        del tts._preset_voices[name]
+    _write(tts)
+    return target

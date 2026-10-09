@@ -55,6 +55,7 @@ Environment:
 from __future__ import annotations
 
 import base64
+import asyncio
 import gc
 import hmac
 import io
@@ -78,7 +79,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from vieneu import Vieneu
-from apps.user_voices import load_user_voices, save_user_voice
+from apps.user_voices import (
+    delete_user_voice, load_user_voices, save_user_voice, update_user_voice,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vieneu.api")
@@ -411,6 +414,25 @@ def models():
     }]}
 
 
+@app.post("/v1/audio/speaker-embedding", dependencies=[Depends(_auth)])
+async def speaker_embedding(file: UploadFile = File(...)):
+    """Return the 192-d speaker anchor used by VieNeu voice enrollment."""
+    import tempfile
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+            temporary.write(await file.read())
+            path = temporary.name
+        embedding = await asyncio.to_thread(engine().tts.engine.extract_speaker_emb, path)
+        return {"embedding": np.asarray(embedding, dtype=np.float32).reshape(-1).tolist()}
+    except Exception as exc:
+        raise HTTPException(500, f"speaker embedding failed: {exc}") from exc
+    finally:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
 @app.get("/v1/voices", dependencies=[Depends(_auth)])
 def voices():
     return {"object": "list", "data": engine().voices()}
@@ -539,6 +561,34 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
         os.unlink(path)
         os.unlink(processed_path)
     return {"id": name, "name": name, "description": description, "persisted": True, **clip}
+
+
+class VoiceUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+@app.patch("/v1/voices/{voice_name}", dependencies=[Depends(_auth)])
+def update_voice(voice_name: str, patch: VoiceUpdate):
+    try:
+        updated = update_user_voice(
+            engine().tts, voice_name, new_name=patch.name,
+            description=patch.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    entry = engine().tts._preset_voices[updated]
+    return {"id": updated, "name": updated, "description": entry.get("description", ""),
+            "persisted": True}
+
+
+@app.delete("/v1/voices/{voice_name}", dependencies=[Depends(_auth)])
+def remove_voice(voice_name: str):
+    try:
+        delete_user_voice(engine().tts, voice_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"deleted": True, "id": voice_name}
 
 
 @app.get("/health")
